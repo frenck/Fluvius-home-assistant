@@ -35,7 +35,7 @@ from .coordinator import FluviusEnergyDataUpdateCoordinator
 from .http import async_create_fluvius_session
 from .models import FluviusRuntimeData
 from .statistics import FluviusStatistics, statistic_prefix
-from .store import FluviusEnergyStore
+from .store import FluviusEnergyStore, FluviusTokenStore
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -71,6 +71,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     session = async_create_fluvius_session(hass)
+    token_store = FluviusTokenStore(hass, entry.entry_id)
 
     client = FluviusApiClient(
         session=session,
@@ -81,6 +82,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         meter_type=meter_type,
         remember_me=DEFAULT_REMEMBER_ME,
         options=options,
+        token_store=token_store,
     )
 
     store_unit = options.get(CONF_GAS_UNIT, DEFAULT_GAS_UNIT)

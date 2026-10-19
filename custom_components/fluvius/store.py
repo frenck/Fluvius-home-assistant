@@ -5,7 +5,28 @@ from __future__ import annotations
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
-from .const import GAS_UNIT_KWH, LIFETIME_METRICS, STORAGE_KEY_TEMPLATE, STORAGE_VERSION
+from .const import (
+    GAS_UNIT_KWH,
+    LIFETIME_METRICS,
+    STORAGE_KEY_TEMPLATE,
+    STORAGE_VERSION,
+    TOKEN_STORAGE_KEY_TEMPLATE,
+    TOKEN_STORAGE_VERSION,
+)
+
+
+class FluviusTokenStore:
+    """Persist OAuth tokens so refreshes survive restarts and full logins stay rare."""
+
+    def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
+        key = TOKEN_STORAGE_KEY_TEMPLATE.format(entry_id=entry_id)
+        self._store = Store(hass, TOKEN_STORAGE_VERSION, key)
+
+    async def async_load(self) -> dict | None:
+        return await self._store.async_load()
+
+    async def async_save(self, data: dict) -> None:
+        await self._store.async_save(data)
 
 
 class FluviusEnergyStore:

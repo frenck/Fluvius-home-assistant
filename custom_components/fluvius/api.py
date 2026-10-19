@@ -11,7 +11,13 @@ from typing import Any
 
 import aiohttp
 
-from .auth import FluviusAuthError, async_get_bearer_token
+from .auth import (
+    FluviusAuthError,
+    FluviusCredentialsError,
+    FluviusInvalidRefreshError,
+    async_get_bearer_token,
+    async_refresh_bearer_token,
+)
 from .const import (
     ALL_METRICS,
     CONF_DAYS_BACK,
@@ -100,6 +106,7 @@ class FluviusApiClient:
         meter_type: str = DEFAULT_METER_TYPE,
         remember_me: bool = False,
         options: dict[str, Any] | None = None,
+        token_store: Any = None,
     ) -> None:
         self._session = session
         self._email = email
@@ -109,8 +116,11 @@ class FluviusApiClient:
         self._meter_type = meter_type
         self._remember_me = remember_me
         self._options = options or {}
+        self._token_store = token_store
         self._access_token: str | None = None
         self._token_expires = 0.0
+        self._refresh_token: str | None = None
+        self._stored_tokens_loaded = False
         self._verbose = bool(self._options.get(CONF_VERBOSE_LOGGING, DEFAULT_VERBOSE_LOGGING))
 
     def _log_verbose(self, message: str, *args: Any) -> None:
@@ -188,8 +198,26 @@ class FluviusApiClient:
     # HTTP helpers
     # ------------------------------------------------------------------
     async def _async_get_access_token(self) -> str:
+        await self._async_load_stored_tokens()
         if self._access_token and time.monotonic() < self._token_expires:
             return self._access_token
+        if self._refresh_token:
+            try:
+                access_token, tokens = await async_refresh_bearer_token(
+                    self._session, self._refresh_token, verbose=self._verbose
+                )
+            except FluviusInvalidRefreshError:
+                self._log_verbose("Refresh token rejected; falling back to full login")
+                self._refresh_token = None
+                await self._async_persist_tokens()
+            except (FluviusAuthError, aiohttp.ClientError, TimeoutError) as err:
+                # Transient failure (WAF, throttling, 5xx, network). Retry next
+                # cycle instead of triggering a reauthentication flow.
+                raise FluviusApiError("Fluvius token refresh is temporarily unavailable") from err
+            else:
+                self._store_tokens(access_token, tokens)
+                await self._async_persist_tokens()
+                return access_token
         try:
             access_token, tokens = await async_get_bearer_token(
                 self._session,
@@ -198,15 +226,58 @@ class FluviusApiClient:
                 remember_me=self._remember_me,
                 verbose=self._verbose,
             )
+        except FluviusCredentialsError as err:
+            raise FluviusAuthenticationError("Fluvius rejected the credentials") from err
         except FluviusAuthError as err:
-            raise FluviusAuthenticationError("Fluvius authentication failed") from err
+            # HTML scraping or endpoint hiccup during full login: transient.
+            raise FluviusApiError("Fluvius authentication is temporarily unavailable") from err
         except (aiohttp.ClientError, TimeoutError) as err:
             raise FluviusApiError("Cannot reach Fluvius authentication") from err
         if not access_token:
-            raise FluviusAuthenticationError("Fluvius returned no access token")
+            raise FluviusApiError("Fluvius returned no access token")
+        self._store_tokens(access_token, tokens)
+        await self._async_persist_tokens()
+        return access_token
+
+    def _store_tokens(self, access_token: str, tokens: dict[str, Any]) -> None:
         self._access_token = access_token
         self._token_expires = time.monotonic() + max(0, int(tokens.get("expires_in", 3600)) - 60)
-        return access_token
+        if tokens.get("refresh_token"):
+            self._refresh_token = tokens["refresh_token"]
+
+    async def _async_load_stored_tokens(self) -> None:
+        if self._stored_tokens_loaded:
+            return
+        self._stored_tokens_loaded = True
+        if self._token_store is None:
+            return
+        try:
+            data = await self._token_store.async_load()
+        except Exception:  # noqa: BLE001 - token storage must never break auth
+            LOGGER.debug("Unable to load stored Fluvius tokens", exc_info=True)
+            return
+        if not data:
+            return
+        self._refresh_token = data.get("refresh_token")
+        expires_at = float(data.get("access_expires_at") or 0.0)
+        remaining = expires_at - time.time()
+        if data.get("access_token") and remaining > 120:
+            self._access_token = data["access_token"]
+            self._token_expires = time.monotonic() + remaining - 60
+
+    async def _async_persist_tokens(self) -> None:
+        if self._token_store is None:
+            return
+        expires_in = max(0.0, self._token_expires - time.monotonic())
+        data = {
+            "refresh_token": self._refresh_token,
+            "access_token": self._access_token,
+            "access_expires_at": time.time() + expires_in if self._access_token else 0.0,
+        }
+        try:
+            await self._token_store.async_save(data)
+        except Exception:  # noqa: BLE001 - token storage must never break auth
+            LOGGER.debug("Unable to persist Fluvius tokens", exc_info=True)
 
     async def _fetch_raw_consumption(self, access_token: str) -> list[dict[str, Any]]:
         # Daily summaries must stay daily even when detailed history is enabled.
@@ -245,7 +316,10 @@ class FluviusApiClient:
                     if response.status == 401:
                         self._access_token = None
                         if attempt:
-                            raise FluviusAuthenticationError("Fluvius rejected the access token")
+                            # A freshly issued token was still rejected: the
+                            # credentials were just validated by the token
+                            # endpoint, so this is a service-side problem.
+                            raise FluviusApiError("Fluvius rejected a fresh access token")
                     else:
                         response.raise_for_status()
                         data = await response.json()
@@ -259,7 +333,7 @@ class FluviusApiClient:
                     f"Fluvius {endpoint} request failed ({type(err).__name__})"
                 ) from err
             access_token = await self._async_get_access_token()
-        raise FluviusAuthenticationError("Fluvius rejected the access token")
+        raise FluviusApiError("Fluvius rejected a fresh access token")
 
     @property
     def days_back(self) -> int:

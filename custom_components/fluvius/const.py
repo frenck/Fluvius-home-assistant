@@ -46,6 +46,8 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 STORAGE_VERSION = 1
 STORAGE_KEY_TEMPLATE = "fluvius_{entry_id}"
+TOKEN_STORAGE_VERSION = 1
+TOKEN_STORAGE_KEY_TEMPLATE = "fluvius_auth_{entry_id}"
 
 LIFETIME_METRICS = (
     "consumption_high",
