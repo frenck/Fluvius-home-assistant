@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0
+
+Requires Home Assistant 2026.5 or newer. No reconfiguration is needed: token storage is added automatically on the first refresh after updating. Accounts participating in energiedelen (energy sharing) get new sensors after the restart; all other accounts see no new entities.
+
+- Renew access tokens via the Azure B2C refresh token grant instead of a full credential login on every hourly poll, and persist tokens across restarts.
+- Only trigger reauthentication when Fluvius explicitly rejects the credentials. Transient portal or login failures now retry silently on the next refresh, ending the recurring "credentials expired" notifications reported in [sander110419/Fluvius_API#5](https://github.com/sander110419/Fluvius_API/issues/5).
+- Add energiedelen (energy sharing) support: for each energy exchange, six sensors report shared energy received/injected today, this month, and this year in kWh ([#28](https://github.com/sander110419/Fluvius-home-assistant/issues/28)).
+- Align gas interval requests on the 06:00-06:00 gas day, so detailed gas readings spread over their real hours instead of collapsing into a single 06:00 spike. Thanks [@cdamman](https://github.com/cdamman) ([#25](https://github.com/sander110419/Fluvius-home-assistant/pull/25)).
+
+Validated with 58 tests on Home Assistant 2026.5, live full-login and refresh-grant authentication against the production portal, and a running Home Assistant instance. The energiedelen endpoints follow the Mijn Fluvius frontend contract and were verified for accounts without energy sharing; feedback from energiedelen participants is welcome.
+
 ## 1.1.0
 
 Requires Home Assistant 2026.5 or newer. After updating, restart Home Assistant and select the new **(historical)** sources in the Energy dashboard. Old sensor history is not automatically rewritten.
