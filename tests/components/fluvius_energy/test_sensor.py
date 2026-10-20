@@ -71,6 +71,10 @@ async def test_sensors_populate_state(hass):
             "custom_components.fluvius.FluviusApiClient.fetch_daily_summaries_with_spikes",
             AsyncMock(return_value=([summary], [peak])),
         ),
+        patch(
+            "custom_components.fluvius.FluviusApiClient.fetch_energy_sharing",
+            AsyncMock(return_value=[]),
+        ),
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()

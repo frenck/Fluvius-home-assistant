@@ -19,7 +19,7 @@ UTC = UTC
 
 
 def client(**options):
-    return FluviusApiClient(
+    obj = FluviusApiClient(
         session=MagicMock(),
         email="test@example.com",
         password="test",
@@ -27,6 +27,8 @@ def client(**options):
         meter_serial="TEST",
         options=options,
     )
+    obj.fetch_energy_sharing = AsyncMock(return_value=[])
+    return obj
 
 
 def day(start, value, hours=24):

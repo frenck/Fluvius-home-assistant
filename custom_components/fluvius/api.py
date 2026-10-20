@@ -51,6 +51,12 @@ LOGGER = logging.getLogger(__name__)
 CUBIC_METER_UNIT_CODE = 5
 KILO_WATT_HOUR_UNIT_CODE = 3
 
+ENERGIEDELEN_API_BASE = "https://mijn.fluvius.be/energiedelen/api"
+# chartPeriodType values used by the Mijn Fluvius energiedelen app:
+# 6 = month view (day-bucketed), 7 = year view (month-bucketed).
+CHART_PERIOD_TYPE_MONTH = 6
+CHART_PERIOD_TYPE_YEAR = 7
+
 
 class FluviusApiError(RuntimeError):
     """Raised when the Fluvius API call fails."""
@@ -90,6 +96,53 @@ class FluviusQuarterHourlyMeasurement:
     consumption: float  # kWh consumed in this interval
     injection: float  # kWh injected in this interval
     metrics: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class FluviusEnergySharingMeasurement:
+    """Container for a single exchanged-energy bucket (day or month)."""
+
+    start: datetime
+    consumption: float  # shared energy received in this bucket (kWh)
+    injection: float  # shared energy injected in this bucket (kWh)
+
+
+@dataclass(slots=True)
+class FluviusEnergySharingSummary:
+    """Exchanged-energy buckets and totals for one energy exchange (energiedelen)."""
+
+    exchange_id: int
+    name: str | None
+    daily: list[FluviusEnergySharingMeasurement] = field(default_factory=list)
+    monthly: list[FluviusEnergySharingMeasurement] = field(default_factory=list)
+    totals: dict[str, float] = field(default_factory=dict)
+
+    def compute_totals(self, tz) -> dict[str, float]:
+        """Compute received/injected totals for today, this month and this year."""
+        now = datetime.now(tz)
+        today = now.date()
+
+        def _received(measurements: list[FluviusEnergySharingMeasurement], pred) -> float:
+            return round(
+                sum(m.consumption for m in measurements if pred(m.start.astimezone(tz))), 3
+            )
+
+        def _injected(measurements: list[FluviusEnergySharingMeasurement], pred) -> float:
+            return round(sum(m.injection for m in measurements if pred(m.start.astimezone(tz))), 3)
+
+        self.totals = {
+            "received_today": _received(self.daily, lambda d: d.date() == today),
+            "injected_today": _injected(self.daily, lambda d: d.date() == today),
+            "received_month": _received(
+                self.daily, lambda d: (d.year, d.month) == (now.year, now.month)
+            ),
+            "injected_month": _injected(
+                self.daily, lambda d: (d.year, d.month) == (now.year, now.month)
+            ),
+            "received_year": _received(self.monthly, lambda d: d.year == now.year),
+            "injected_year": _injected(self.monthly, lambda d: d.year == now.year),
+        }
+        return self.totals
 
 
 class FluviusApiClient:
@@ -165,6 +218,48 @@ class FluviusApiClient:
                 if measurement.end <= self.history_end:
                     measurements[measurement.start] = measurement
         return sorted(measurements.values(), key=lambda item: item.start)
+
+    async def fetch_energy_sharing(self) -> list[FluviusEnergySharingSummary]:
+        """Fetch energiedelen (energy sharing) exchanged energy, if any.
+
+        Accounts without energy sharing get an empty list. Failures never block
+        the regular consumption polling: callers should treat FluviusApiError
+        as "sharing temporarily unavailable".
+        """
+        if self._meter_type == METER_TYPE_GAS:
+            return []
+        payload = await self._request_energiedelen("GET", "energy-exchanges")
+        if isinstance(payload, dict):
+            exchanges = payload.get("data") or []
+        elif isinstance(payload, list):
+            exchanges = payload
+        else:
+            exchanges = []
+        if not exchanges:
+            return []
+
+        tz = self._resolve_timezone(self._options.get(CONF_TIMEZONE, DEFAULT_TIMEZONE))
+        (month_start, month_end), (year_start, year_end) = self._energy_sharing_ranges(tz)
+        summaries: list[FluviusEnergySharingSummary] = []
+        for exchange in exchanges:
+            if not isinstance(exchange, dict):
+                continue
+            exchange_id = exchange.get("id") or exchange.get("energyExchangeId")
+            if exchange_id is None:
+                continue
+            summary = FluviusEnergySharingSummary(
+                exchange_id=int(exchange_id),
+                name=exchange.get("name") or exchange.get("description"),
+            )
+            summary.daily = await self._fetch_exchanged_energy(
+                summary.exchange_id, CHART_PERIOD_TYPE_MONTH, month_start, month_end
+            )
+            summary.monthly = await self._fetch_exchanged_energy(
+                summary.exchange_id, CHART_PERIOD_TYPE_YEAR, year_start, year_end
+            )
+            summary.compute_totals(tz)
+            summaries.append(summary)
+        return summaries
 
     async def _fetch_summaries_and_spikes(
         self,
@@ -334,6 +429,107 @@ class FluviusApiClient:
                 ) from err
             access_token = await self._async_get_access_token()
         raise FluviusApiError("Fluvius rejected a fresh access token")
+
+    async def _request_energiedelen(
+        self, method: str, path: str, *, json_body: dict | None = None
+    ) -> Any:
+        """Call the energiedelen API with the same token as the history API.
+
+        Returns None when the feature is unavailable for the account (403/404).
+        """
+        url = f"{ENERGIEDELEN_API_BASE}/{path}"
+        self._log_verbose("Energiedelen request %s %s", method, path)
+        for attempt in range(2):
+            access_token = self._access_token or await self._async_get_access_token()
+            try:
+                async with self._session.request(
+                    method,
+                    url,
+                    json=json_body,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Accept": "application/json",
+                    },
+                    timeout=30,
+                ) as response:
+                    if response.status == 401:
+                        self._access_token = None
+                        if attempt:
+                            raise FluviusApiError("Fluvius rejected a fresh access token")
+                    elif response.status in (403, 404):
+                        return None
+                    else:
+                        response.raise_for_status()
+                        return await response.json()
+            except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+                raise FluviusApiError(
+                    f"Fluvius energiedelen request failed ({type(err).__name__})"
+                ) from err
+        raise FluviusApiError("Fluvius rejected a fresh access token")
+
+    async def _fetch_exchanged_energy(
+        self, exchange_id: int, period_type: int, start: datetime, end: datetime
+    ) -> list[FluviusEnergySharingMeasurement]:
+        body = {
+            "energyExchangeId": exchange_id,
+            "eans": [self._ean],
+            "chartPeriodType": period_type,
+            "startDateUtc": start.isoformat(timespec="milliseconds"),
+            "endDateUtc": end.isoformat(timespec="milliseconds"),
+        }
+        payload = await self._request_energiedelen(
+            "POST", f"energy-exchanges/{exchange_id}/chart-exchanged-energy", json_body=body
+        )
+        return self._exchanged_energy_from_payload(payload)
+
+    def _exchanged_energy_from_payload(self, payload: Any) -> list[FluviusEnergySharingMeasurement]:
+        if isinstance(payload, dict):
+            items = payload.get("exchangedEnergy") or payload.get("data") or []
+        elif isinstance(payload, list):
+            items = payload
+        else:
+            items = []
+        if payload is not None and not items:
+            self._log_verbose("Energiedelen payload contained no items: %s", str(payload)[:200])
+        measurements: list[FluviusEnergySharingMeasurement] = []
+        dropped = 0
+        for item in items:
+            if not isinstance(item, dict):
+                dropped += 1
+                continue
+            start = self._parse_datetime(
+                item.get("startDateUtc") or item.get("startDate") or item.get("d")
+            )
+            measurement = item.get("measurement")
+            if not isinstance(measurement, dict):
+                measurement = item
+            consumption = measurement.get("consumptionValue")
+            injection = measurement.get("injectionValue")
+            if start is None or (consumption is None and injection is None):
+                dropped += 1
+                continue
+            measurements.append(
+                FluviusEnergySharingMeasurement(
+                    start=start,
+                    consumption=self._safe_float(consumption),
+                    injection=self._safe_float(injection),
+                )
+            )
+        if dropped:
+            self._log_verbose("Dropped %d energiedelen items with unexpected shape", dropped)
+        return sorted(measurements, key=lambda item: item.start)
+
+    @staticmethod
+    def _energy_sharing_ranges(tz) -> tuple[tuple[datetime, datetime], tuple[datetime, datetime]]:
+        now = datetime.now(tz)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if month_start.month == 12:
+            month_end = month_start.replace(year=month_start.year + 1, month=1)
+        else:
+            month_end = month_start.replace(month=month_start.month + 1)
+        year_start = month_start.replace(month=1)
+        year_end = year_start.replace(year=year_start.year + 1)
+        return (month_start, month_end), (year_start, year_end)
 
     @property
     def days_back(self) -> int:

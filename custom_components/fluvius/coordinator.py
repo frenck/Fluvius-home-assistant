@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -14,6 +14,7 @@ from .api import (
     FluviusApiError,
     FluviusAuthenticationError,
     FluviusDailySummary,
+    FluviusEnergySharingSummary,
     FluviusPeakMeasurement,
     FluviusQuarterHourlyMeasurement,
 )
@@ -32,6 +33,7 @@ class FluviusCoordinatorData:
     lifetime_totals: dict[str, float]
     peak_measurements: list[FluviusPeakMeasurement]
     quarter_hourly_measurements: list[FluviusQuarterHourlyMeasurement]
+    energy_sharing: list[FluviusEnergySharingSummary] = field(default_factory=list)
 
 
 class FluviusEnergyDataUpdateCoordinator(DataUpdateCoordinator[FluviusCoordinatorData]):
@@ -80,6 +82,14 @@ class FluviusEnergyDataUpdateCoordinator(DataUpdateCoordinator[FluviusCoordinato
             await self._store.async_process_summary(summary.day_id, summary.metrics)
 
         previous = self.data
+        energy_sharing = previous.energy_sharing if previous else []
+        try:
+            energy_sharing = await self._client.fetch_energy_sharing()
+        except FluviusAuthenticationError as err:
+            raise ConfigEntryAuthFailed(str(err)) from err
+        except FluviusApiError as err:
+            LOGGER.debug("Energy sharing data is temporarily unavailable: %s", err)
+
         latest = summaries[-1] if summaries else (previous.latest_summary if previous else None)
         if latest is None and intervals:
             # Detailed-only meters still get a meaningful latest-period reading.
@@ -95,4 +105,5 @@ class FluviusEnergyDataUpdateCoordinator(DataUpdateCoordinator[FluviusCoordinato
             peak_measurements=peaks or (previous.peak_measurements if previous else []),
             quarter_hourly_measurements=intervals
             or (previous.quarter_hourly_measurements if previous else []),
+            energy_sharing=energy_sharing,
         )

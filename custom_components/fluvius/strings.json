@@ -87,6 +87,24 @@
       },
       "hourly_consumption": {
         "name": "Consumption (hourly)"
+      },
+      "energy_sharing_received_today": {
+        "name": "Shared energy received (today)"
+      },
+      "energy_sharing_received_month": {
+        "name": "Shared energy received (this month)"
+      },
+      "energy_sharing_received_year": {
+        "name": "Shared energy received (this year)"
+      },
+      "energy_sharing_injected_today": {
+        "name": "Shared energy injected (today)"
+      },
+      "energy_sharing_injected_month": {
+        "name": "Shared energy injected (this month)"
+      },
+      "energy_sharing_injected_year": {
+        "name": "Shared energy injected (this year)"
       }
     }
   },

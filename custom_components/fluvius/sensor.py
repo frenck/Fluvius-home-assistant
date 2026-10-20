@@ -18,7 +18,11 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import FluviusPeakMeasurement, FluviusQuarterHourlyMeasurement
+from .api import (
+    FluviusEnergySharingSummary,
+    FluviusPeakMeasurement,
+    FluviusQuarterHourlyMeasurement,
+)
 from .const import (
     CONF_EAN,
     CONF_GAS_UNIT,
@@ -151,6 +155,33 @@ QUARTER_HOURLY_INJECTION_DESCRIPTION = SensorEntityDescription(
     suggested_display_precision=3,
 )
 
+# Energy sharing (energiedelen): per exchange, received/injected x today/month/year.
+# The metric key matches FluviusEnergySharingSummary.totals.
+ENERGY_SHARING_SENSOR_KINDS: tuple[tuple[str, str, str], ...] = (
+    ("received_today", "energy_sharing_received_today", "Fluvius shared energy received (today)"),
+    (
+        "received_month",
+        "energy_sharing_received_month",
+        "Fluvius shared energy received (this month)",
+    ),
+    (
+        "received_year",
+        "energy_sharing_received_year",
+        "Fluvius shared energy received (this year)",
+    ),
+    ("injected_today", "energy_sharing_injected_today", "Fluvius shared energy injected (today)"),
+    (
+        "injected_month",
+        "energy_sharing_injected_month",
+        "Fluvius shared energy injected (this month)",
+    ),
+    (
+        "injected_year",
+        "energy_sharing_injected_year",
+        "Fluvius shared energy injected (this year)",
+    ),
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -222,6 +253,36 @@ async def async_setup_entry(
     )
     unit = gas_unit if meter_type == METER_TYPE_GAS else "kwh"
     prefix = statistic_prefix(ean, meter_type, unit, entry.options.get(CONF_HISTORY_UNTIL))
+
+    # Energy sharing (energiedelen): one sensor set per energy exchange. The
+    # coordinator already fetched sharing data during the first refresh, so
+    # accounts without energiedelen simply get no extra entities.
+    sharing_data = coordinator.data.energy_sharing if coordinator.data else []
+    if meter_type != METER_TYPE_GAS:
+        for summary in sharing_data:
+            suffix = f" ({summary.name})" if summary.name and len(sharing_data) > 1 else ""
+            for metric, translation_key, name in ENERGY_SHARING_SENSOR_KINDS:
+                description = SensorEntityDescription(
+                    key=f"energy_sharing_{metric}",
+                    translation_key=translation_key,
+                    name=f"{name}{suffix}",
+                    device_class=SensorDeviceClass.ENERGY,
+                    native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                    state_class=SensorStateClass.TOTAL,
+                    suggested_display_precision=3,
+                )
+                entities.append(
+                    FluviusEnergySharingSensor(
+                        description,
+                        coordinator,
+                        entry.entry_id,
+                        ean,
+                        meter_serial,
+                        summary.exchange_id,
+                        metric,
+                    )
+                )
+
     for entity in entities:
         metric = entity.entity_description.key
         if metric.startswith("quarter_hourly_"):
@@ -516,4 +577,64 @@ class FluviusQuarterHourlyInjectionSensor(
             "last_interval_value": round(latest.injection, 3),
             "interval_count": len(data.quarter_hourly_measurements),
             "quarter_hourly_injection": hourly_data,
+        }
+
+
+class FluviusEnergySharingSensor(
+    CoordinatorEntity[FluviusEnergyDataUpdateCoordinator], SensorEntity
+):
+    """Expose energiedelen (energy sharing) totals for one energy exchange."""
+
+    entity_description: SensorEntityDescription
+
+    def __init__(
+        self,
+        description: SensorEntityDescription,
+        coordinator: FluviusEnergyDataUpdateCoordinator,
+        entry_id: str,
+        ean: str,
+        meter_serial: str,
+        exchange_id: int,
+        metric: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._exchange_id = exchange_id
+        self._metric = metric
+        self._attr_unique_id = f"{entry_id}_energy_sharing_{exchange_id}_{metric}"
+        self._attr_has_entity_name = True
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, ean)},
+            manufacturer="Fluvius",
+            model=meter_serial,
+            name=f"Fluvius meter {meter_serial}",
+        )
+
+    def _summary(self) -> FluviusEnergySharingSummary | None:
+        data: FluviusCoordinatorData | None = self.coordinator.data
+        if not data:
+            return None
+        for summary in data.energy_sharing:
+            if summary.exchange_id == self._exchange_id:
+                return summary
+        return None
+
+    @property
+    def native_value(self) -> float | None:
+        summary = self._summary()
+        if not summary or not summary.totals:
+            return None
+        value = summary.totals.get(self._metric)
+        return round(value, 3) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        summary = self._summary()
+        if not summary:
+            return None
+        return {
+            "energy_exchange_id": summary.exchange_id,
+            "energy_exchange_name": summary.name,
+            "daily_buckets": len(summary.daily),
+            "monthly_buckets": len(summary.monthly),
         }
