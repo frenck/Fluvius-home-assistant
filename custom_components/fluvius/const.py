@@ -42,6 +42,13 @@ GAS_SUPPORTED_GRANULARITY = "4"
 QUARTER_HOURLY_GRANULARITY = "1"
 HOURLY_GRANULARITY = "2"
 
+# Fluvius registers gas against a "gas day" running 06:00 -> 06:00 local: the daily
+# summaries come back spanning 05:00Z -> 05:00Z in winter, not midnight to midnight.
+# Interval requests must use the same boundaries, because the statistics layer only
+# lets fine readings replace a daily total when they tile that period exactly. A
+# calendar-day window never tiles a gas day, so every reading collapses into the
+# single 06:00 bucket. Electricity uses plain calendar days.
+GAS_DAY_START_HOUR = 6
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 STORAGE_VERSION = 1
